@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -15,7 +15,11 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import GroupKFold
 
-from tabular_ml.calibration import expected_calibration_error
+from tabular_ml.calibration import (
+    ReliabilityDiagram,
+    expected_calibration_error,
+    reliability_bins,
+)
 
 
 @dataclass
@@ -37,16 +41,24 @@ class CVResult:
     mean_brier: float
     mean_ece: float
     calibrated: bool
+    calibration_method: str | None = None
+    y_true_oof: np.ndarray | None = field(default=None, repr=False)
+    y_prob_oof: np.ndarray | None = field(default=None, repr=False)
+    reliability: ReliabilityDiagram | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "calibrated": self.calibrated,
+            "calibration_method": self.calibration_method,
             "mean_accuracy": self.mean_accuracy,
             "mean_roc_auc": self.mean_roc_auc,
             "mean_brier": self.mean_brier,
             "mean_ece": self.mean_ece,
             "folds": [f.__dict__ for f in self.folds],
         }
+        if self.reliability is not None:
+            out["reliability"] = self.reliability.as_dict()
+        return out
 
 
 class GroupAwareCalibratedClassifier(ClassifierMixin, BaseEstimator):
@@ -102,11 +114,17 @@ def evaluate_grouped_cv(
     calibrate: bool = False,
     calibration_method: str = "sigmoid",
     random_state: int = 0,
+    return_oof: bool = False,
+    n_bins: int = 10,
 ) -> CVResult:
     """Score an estimator with GroupKFold; fit only on each train split.
 
     When ``calibrate`` is True, wraps the clone in GroupAwareCalibratedClassifier
     so inner calibration folds never see the outer test groups.
+
+    When ``return_oof`` is True, also stores concatenated out-of-fold
+    labels/probabilities and a pooled reliability diagram (useful for
+    reliability PNGs and ECE beyond per-fold means).
     """
     del random_state  # reserved for future shuffled group variants
     X = np.asarray(X)
@@ -121,8 +139,13 @@ def evaluate_grouped_cv(
             f"need at least {n_splits} groups for GroupKFold, got {unique_groups.size}"
         )
 
+    if calibrate and calibration_method not in {"sigmoid", "isotonic"}:
+        raise ValueError("calibration_method must be 'sigmoid' or 'isotonic'")
+
     gkf = GroupKFold(n_splits=n_splits)
     fold_metrics: list[FoldMetrics] = []
+    oof_true: list[np.ndarray] = []
+    oof_prob: list[np.ndarray] = []
 
     for fold_i, (train_idx, test_idx) in enumerate(gkf.split(X, y, groups)):
         X_train, X_test = X[train_idx], X[test_idx]
@@ -149,11 +172,20 @@ def evaluate_grouped_cv(
                 accuracy=float(accuracy_score(y_test, pred)),
                 roc_auc=float(roc_auc_score(y_test, proba)),
                 brier=float(brier_score_loss(y_test, proba)),
-                ece=float(expected_calibration_error(y_test, proba)),
+                ece=float(expected_calibration_error(y_test, proba, n_bins=n_bins)),
                 n_train=int(train_idx.size),
                 n_test=int(test_idx.size),
             )
         )
+        if return_oof:
+            oof_true.append(y_test)
+            oof_prob.append(proba)
+
+    y_true_oof = np.concatenate(oof_true) if oof_true else None
+    y_prob_oof = np.concatenate(oof_prob) if oof_prob else None
+    reliability = None
+    if y_true_oof is not None and y_prob_oof is not None:
+        reliability = reliability_bins(y_true_oof, y_prob_oof, n_bins=n_bins)
 
     return CVResult(
         folds=fold_metrics,
@@ -162,4 +194,50 @@ def evaluate_grouped_cv(
         mean_brier=float(np.mean([f.brier for f in fold_metrics])),
         mean_ece=float(np.mean([f.ece for f in fold_metrics])),
         calibrated=calibrate,
+        calibration_method=calibration_method if calibrate else None,
+        y_true_oof=y_true_oof,
+        y_prob_oof=y_prob_oof,
+        reliability=reliability,
     )
+
+
+def compare_calibration_methods(
+    estimator: Any,
+    X: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+    n_splits: int = 5,
+    methods: tuple[str, ...] = ("raw", "sigmoid", "isotonic"),
+    n_bins: int = 10,
+) -> dict[str, CVResult]:
+    """GroupKFold eval for raw vs Platt (sigmoid) vs isotonic calibration.
+
+    Reuses ``GroupAwareCalibratedClassifier`` so calibration folds never
+    see outer test groups. Returns a dict keyed by method name.
+    """
+    results: dict[str, CVResult] = {}
+    for method in methods:
+        if method == "raw":
+            results[method] = evaluate_grouped_cv(
+                estimator,
+                X,
+                y,
+                groups,
+                n_splits=n_splits,
+                calibrate=False,
+                return_oof=True,
+                n_bins=n_bins,
+            )
+        else:
+            results[method] = evaluate_grouped_cv(
+                estimator,
+                X,
+                y,
+                groups,
+                n_splits=n_splits,
+                calibrate=True,
+                calibration_method=method,
+                return_oof=True,
+                n_bins=n_bins,
+            )
+    return results
